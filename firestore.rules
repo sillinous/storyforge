@@ -1,0 +1,220 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // =========================================================================
+    // HELPER FUNCTIONS
+    // =========================================================================
+    
+    // Check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Get user ID
+    function userId() {
+      return request.auth.uid;
+    }
+    
+    // Check if user is a member of the project
+    function isProjectMember(projectId) {
+      let project = get(/databases/$(database)/documents/projects/$(projectId));
+      return project != null && userId() in project.data.memberIds;
+    }
+    
+    // Check if user is the project owner
+    function isProjectOwner(projectId) {
+      let project = get(/databases/$(database)/documents/projects/$(projectId));
+      return project != null && project.data.ownerId == userId();
+    }
+    
+    // Check user's role in project
+    function getUserRole(projectId) {
+      let project = get(/databases/$(database)/documents/projects/$(projectId));
+      return project.data.members[userId()].role;
+    }
+    
+    // Check if user can write (owner, admin, editor, or writer)
+    function canWrite(projectId) {
+      let role = getUserRole(projectId);
+      return role in ['owner', 'admin', 'editor', 'writer'];
+    }
+    
+    // Check if user is admin or owner
+    function isAdmin(projectId) {
+      let role = getUserRole(projectId);
+      return role in ['owner', 'admin'];
+    }
+    
+    // Check if user can manage team (owner or admin)
+    function canManageTeam(projectId) {
+      return isProjectOwner(projectId) || isAdmin(projectId);
+    }
+    
+    // =========================================================================
+    // USER PROFILES
+    // =========================================================================
+    
+    match /users/{userDocId} {
+      // Users can read any profile (for collaboration features)
+      allow read: if isAuthenticated();
+      
+      // Users can only write their own profile
+      allow write: if isAuthenticated() && request.auth.uid == userDocId;
+      
+      // User notifications subcollection
+      match /notifications/{notificationId} {
+        allow read: if isAuthenticated() && request.auth.uid == userDocId;
+        allow create: if isAuthenticated(); // Any authenticated user can create notifications for others
+        allow update, delete: if isAuthenticated() && request.auth.uid == userDocId;
+      }
+    }
+    
+    // =========================================================================
+    // PROJECTS
+    // =========================================================================
+    
+    match /projects/{projectId} {
+      // Members can read the project
+      allow read: if isAuthenticated() && isProjectMember(projectId);
+      
+      // Authenticated users can create projects (they become owner)
+      allow create: if isAuthenticated() 
+        && request.resource.data.ownerId == userId()
+        && userId() in request.resource.data.memberIds;
+      
+      // Members with write access can update (except membership fields)
+      allow update: if isAuthenticated() && isProjectMember(projectId)
+        && (canWrite(projectId) || isProjectOwner(projectId));
+      
+      // Only owner can delete
+      allow delete: if isAuthenticated() && isProjectOwner(projectId);
+      
+      // -----------------------------------------
+      // ENTITIES (Subcollection)
+      // -----------------------------------------
+      match /entities/{entityId} {
+        allow read: if isAuthenticated() && isProjectMember(projectId);
+        allow create: if isAuthenticated() && isProjectMember(projectId) && canWrite(projectId);
+        allow update: if isAuthenticated() && isProjectMember(projectId) && canWrite(projectId);
+        allow delete: if isAuthenticated() && isProjectMember(projectId) && canWrite(projectId);
+      }
+      
+      // -----------------------------------------
+      // RELATIONSHIPS (Subcollection)
+      // -----------------------------------------
+      match /relationships/{relationshipId} {
+        allow read: if isAuthenticated() && isProjectMember(projectId);
+        allow create: if isAuthenticated() && isProjectMember(projectId) && canWrite(projectId);
+        allow update: if isAuthenticated() && isProjectMember(projectId) && canWrite(projectId);
+        allow delete: if isAuthenticated() && isProjectMember(projectId) && canWrite(projectId);
+      }
+      
+      // -----------------------------------------
+      // NARRATIVE (Subcollection) - Series/Books/Chapters/Beats/Pages/Panels
+      // -----------------------------------------
+      match /narrative/{docId} {
+        allow read: if isAuthenticated() && isProjectMember(projectId);
+        allow write: if isAuthenticated() && isProjectMember(projectId) && canWrite(projectId);
+        
+        // Books subcollection
+        match /books/{bookId} {
+          allow read: if isAuthenticated() && isProjectMember(projectId);
+          allow write: if isAuthenticated() && isProjectMember(projectId) && canWrite(projectId);
+          
+          // Chapters subcollection
+          match /chapters/{chapterId} {
+            allow read: if isAuthenticated() && isProjectMember(projectId);
+            allow write: if isAuthenticated() && isProjectMember(projectId) && canWrite(projectId);
+            
+            // Beats subcollection (contains pages and panels as nested arrays)
+            match /beats/{beatId} {
+              allow read: if isAuthenticated() && isProjectMember(projectId);
+              allow write: if isAuthenticated() && isProjectMember(projectId) && canWrite(projectId);
+            }
+          }
+        }
+      }
+      
+      // -----------------------------------------
+      // ACTIVITIES (Subcollection) - Audit log
+      // -----------------------------------------
+      match /activities/{activityId} {
+        // All members can read activities
+        allow read: if isAuthenticated() && isProjectMember(projectId);
+        
+        // Writers can create activities (logged automatically)
+        allow create: if isAuthenticated() && isProjectMember(projectId);
+        
+        // Activities should not be modified or deleted (immutable audit log)
+        allow update, delete: if false;
+      }
+      
+      // -----------------------------------------
+      // PRESENCE (Subcollection) - Who's online & editing
+      // -----------------------------------------
+      match /presence/{presenceUserId} {
+        // All members can read presence
+        allow read: if isAuthenticated() && isProjectMember(projectId);
+        
+        // Users can only write their own presence
+        allow write: if isAuthenticated() 
+          && isProjectMember(projectId) 
+          && presenceUserId == userId();
+      }
+      
+      // -----------------------------------------
+      // INVITES (Subcollection) - Project sharing
+      // -----------------------------------------
+      match /invites/{inviteId} {
+        // Admins can read all invites
+        allow read: if isAuthenticated() && isProjectMember(projectId) && canManageTeam(projectId);
+        
+        // Admins can create invites
+        allow create: if isAuthenticated() && isProjectMember(projectId) && canManageTeam(projectId);
+        
+        // Anyone authenticated can update (to accept invite) - validated in application logic
+        allow update: if isAuthenticated();
+        
+        // Admins can delete (revoke) invites
+        allow delete: if isAuthenticated() && isProjectMember(projectId) && canManageTeam(projectId);
+      }
+      
+      // -----------------------------------------
+      // COMMENTS (Subcollection) - Collaborative annotations
+      // -----------------------------------------
+      match /comments/{commentId} {
+        // All members can read comments
+        allow read: if isAuthenticated() && isProjectMember(projectId);
+        
+        // Writers can create comments
+        allow create: if isAuthenticated() && isProjectMember(projectId) && canWrite(projectId);
+        
+        // Users can update their own comments, admins can update any
+        allow update: if isAuthenticated() && isProjectMember(projectId) 
+          && (resource.data.userId == userId() || canManageTeam(projectId));
+        
+        // Users can delete their own comments, admins can delete any
+        allow delete: if isAuthenticated() && isProjectMember(projectId) 
+          && (resource.data.userId == userId() || canManageTeam(projectId));
+      }
+      
+      // -----------------------------------------
+      // VERSIONS (Subcollection) - Version history snapshots
+      // -----------------------------------------
+      match /versions/{versionId} {
+        // All members can read versions
+        allow read: if isAuthenticated() && isProjectMember(projectId);
+        
+        // Writers can create version snapshots
+        allow create: if isAuthenticated() && isProjectMember(projectId) && canWrite(projectId);
+        
+        // Versions are immutable - no updates allowed
+        allow update: if false;
+        
+        // Only admins can delete versions
+        allow delete: if isAuthenticated() && isProjectMember(projectId) && canManageTeam(projectId);
+      }
+    }
+  }
+}
